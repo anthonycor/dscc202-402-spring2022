@@ -66,6 +66,7 @@ display(airbnbDF)
 # COMMAND ----------
 
 # TODO
+airbnbDF["price"] = airbnbDF["price"].replace('[\$,]', '', regex=True).astype(float)
 
 # COMMAND ----------
 
@@ -77,6 +78,11 @@ display(airbnbDF)
 # COMMAND ----------
 
 # TODO
+airbnbDF = airbnbDF.loc[(airbnbDF['price'] > 0) & (airbnbDF['price'] <= 1000)] 
+airbnbDF = airbnbDF.drop(["cancellation_policy", "host_is_superhost", "instant_bookable"], axis=1)
+airbnbDF["trunc_lat"] = round(airbnbDF["latitude"],2)
+airbnbDF["trunc_long"] = round(airbnbDF["longitude"],2)
+airbnbDF = airbnbDF.drop(["latitude", "longitude"], axis=1)
 
 # COMMAND ----------
 
@@ -87,6 +93,37 @@ display(airbnbDF)
 # COMMAND ----------
 
 # TODO
+#https://scikit-learn.org/stable/auto_examples/ensemble/plot_gradient_boosting_categorical.html#sphx-glr-auto-examples-ensemble-plot-gradient-boosting-categorical-py
+from sklearn.pipeline import make_pipeline
+from sklearn.compose import make_column_transformer
+from sklearn.compose import make_column_selector
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import OrdinalEncoder
+
+categorical_columns_subset = [
+    "neighbourhood_cleansed",
+    "zipcode",
+    "property_type",
+    "room_type",
+    "bed_type"
+]
+airbnbDF[categorical_columns_subset] = airbnbDF[categorical_columns_subset].astype("category")
+
+ordinal_encoder = make_column_transformer(
+    (
+        make_pipeline(
+            SimpleImputer(strategy="constant", fill_value="unknown"),
+            OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=np.nan)
+        ),
+        make_column_selector(dtype_include="category"),
+    ),
+    remainder="passthrough",
+)
+airbnbDF_encoded = pd.DataFrame(ordinal_encoder.fit_transform(airbnbDF))
+airbnbDF_encoded.columns=airbnbDF.columns
+airbnbDF_encoded.index=airbnbDF.index
+
+display(airbnbDF_encoded)
 
 # COMMAND ----------
 
@@ -99,7 +136,7 @@ display(airbnbDF)
 
 # TODO
 from sklearn.model_selection import train_test_split
-
+X_train, X_test, y_train, y_test = train_test_split(airbnbDF_encoded.drop(["price"], axis=1), airbnbDF_encoded[["price"]].values.ravel(), random_state=42)
 
 # COMMAND ----------
 
@@ -119,6 +156,17 @@ from sklearn.model_selection import train_test_split
 # COMMAND ----------
 
 # TODO
+import numpy as np
+from sklearn.impute import SimpleImputer
+
+imp = SimpleImputer(missing_values=np.nan, strategy='mean')
+X_train_imputed=pd.DataFrame(imp.fit_transform(X_train))
+X_train_imputed.columns=X_train.columns
+X_train_imputed.index=X_train.index
+
+X_test_imputed=pd.DataFrame(imp.transform(X_test))
+X_test_imputed.columns=X_test.columns
+X_test_imputed.index=X_test.index
 
 # COMMAND ----------
 
@@ -128,6 +176,34 @@ from sklearn.model_selection import train_test_split
 # COMMAND ----------
 
 # TODO
+from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.compose import TransformedTargetRegressor
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, mean_absolute_percentage_error
+
+
+learning_rate = 0.1
+max_iter = 400
+max_depth = 75
+max_leaf_nodes = None
+
+
+# Create model, train it, and create predictions
+category_mask = [c in categorical_columns_subset for c in X_test_imputed.columns]
+gbr = HistGradientBoostingRegressor(learning_rate=learning_rate, max_iter=max_iter, max_depth=max_depth, max_leaf_nodes=max_leaf_nodes, random_state=42, categorical_features=category_mask)
+transformed_reg = TransformedTargetRegressor(gbr, func=np.log, inverse_func=np.exp)
+
+transformed_reg.fit(X_train_imputed, y_train)
+predictions = transformed_reg.predict(X_test_imputed)
+
+mse = mean_squared_error(y_test, predictions)
+mae = mean_absolute_error(y_test, predictions)
+r2 = r2_score(y_test, predictions)
+mape = mean_absolute_percentage_error(y_test, predictions)
+
+
+print("mse: %d, mae: %d, r2: %d, mape: %d" % (mse, mae, r2, mape))
+
+
 
 # COMMAND ----------
 
@@ -139,6 +215,23 @@ from sklearn.model_selection import train_test_split
 
 # TODO
 import mlflow.sklearn
+
+with mlflow.start_run() as run:
+  # Log model
+  model_path = "hist-gradient-boosting-regressor-model"
+  mlflow.sklearn.log_model(transformed_reg, model_path)
+    
+  # Log params
+  mlflow.log_param("max_iter", max_iter)
+  mlflow.log_param("max_depth", max_depth)
+  mlflow.log_param("learning_rate", learning_rate)
+  mlflow.log_param("max_leaf_nodes", max_leaf_nodes)
+
+  # Log metrics
+  mlflow.log_metric("mse", mse)
+  mlflow.log_metric("mae", mae)
+  mlflow.log_metric("r2", r2)
+  mlflow.log_metric("mape", mape) 
 
 
 # COMMAND ----------
@@ -157,6 +250,8 @@ import mlflow.sklearn
 
 # TODO
 import mlflow.pyfunc
+
+gbr_pyfunc_model = mlflow.pyfunc.load_model(model_uri="runs:/271eae268573428db431e1d8748c9370/hist-gradient-boosting-regressor-model")
 
 # COMMAND ----------
 
@@ -182,7 +277,8 @@ class Airbnb_Model(mlflow.pyfunc.PythonModel):
         self.model = model
     
     def predict(self, context, model_input):
-        # FILL_IN
+        predictions = self.model.predict(model_input)
+        return predictions / model_input["accommodates"]
 
 
 # COMMAND ----------
@@ -196,6 +292,8 @@ class Airbnb_Model(mlflow.pyfunc.PythonModel):
 final_model_path =  f"{working_path}/final-model"
 
 # FILL_IN
+final_model = Airbnb_Model(model = gbr_pyfunc_model)
+mlflow.pyfunc.save_model(path=final_model_path.replace("dbfs:", "/dbfs"), python_model=final_model)
 
 # COMMAND ----------
 
@@ -205,6 +303,13 @@ final_model_path =  f"{working_path}/final-model"
 # COMMAND ----------
 
 # TODO
+loaded_model = mlflow.pyfunc.load_model(final_model_path)
+predictions = pd.DataFrame({
+    'per_night_prediction': gbr_pyfunc_model.predict(X_test),
+    'per_person_prediction': loaded_model.predict(X_test),
+    'accommodates': X_test["accommodates"]
+})
+display(predictions)
 
 # COMMAND ----------
 
@@ -222,12 +327,16 @@ final_model_path =  f"{working_path}/final-model"
 
 # COMMAND ----------
 
-# TODO
-save the testing data 
+# TODO save the testing data 
 test_data_path = f"{working_path}/test_data.csv"
-# FILL_IN
+X_test.to_csv(test_data_path, index=False)
 
 prediction_path = f"{working_path}/predictions.csv"
+predictions["per_person_prediction"].to_csv(prediction_path, index=False)
+
+# COMMAND ----------
+
+dbutils.fs.ls("dbfs:/user/acorbet2@ur.rochester.edu/mlflow/99_putting_it_all_together_psp")
 
 # COMMAND ----------
 
@@ -249,7 +358,10 @@ import pandas as pd
 @click.option("--prediction_path", default="", type=str)
 def model_predict(final_model_path, test_data_path, prediction_path):
     # FILL_IN
-
+    loaded_model = mlflow.pyfunc.load_model(final_model_path)
+    test_data = pd.read_csv(test_data_path)
+    predictions = loaded_model.predict(test_data)
+    pd.Series(predictions).to_csv(prediction_path, index=False)
 
 # test model_predict function    
 demo_prediction_path = f"{working_path}/predictions.csv"
@@ -281,8 +393,10 @@ conda_env: conda.yaml
 entry_points:
   main:
     parameters:
-      #FILL_IN
-    command:  "python predict.py #FILL_IN"
+      final_model_path: {type: str}
+      test_data_path: {type: str}
+      prediction_path: {type: str}
+    command:  "python predict.py --final_model_path {final_model_path} --test_data_path {test_data_path} --prediction_path {prediction_path}"
 '''.strip(), overwrite=True)
 
 # COMMAND ----------
@@ -336,7 +450,16 @@ import click
 import mlflow.pyfunc
 import pandas as pd
 
-# put model_predict function with decorators here
+@click.command()
+@click.option("--final_model_path", default="", type=str)
+@click.option("--test_data_path", default="", type=str)
+@click.option("--prediction_path", default="", type=str)
+def model_predict(final_model_path, test_data_path, prediction_path):
+    # FILL_IN
+    loaded_model = mlflow.pyfunc.load_model(final_model_path)
+    test_data = pd.read_csv(test_data_path)
+    predictions = loaded_model.predict(test_data)
+    pd.Series(predictions).to_csv(prediction_path, index=False)
     
 if __name__ == "__main__":
   model_predict()
@@ -367,7 +490,11 @@ display( dbutils.fs.ls(workingDir) )
 # TODO
 second_prediction_path = f"{working_path}/predictions-2.csv"
 mlflow.projects.run(working_path,
-   # FILL_IN
+   parameters={
+    "final_model_path": final_model_path,
+    "test_data_path": test_data_path,
+    "prediction_path": second_prediction_path
+  }
 )
 
 # COMMAND ----------
